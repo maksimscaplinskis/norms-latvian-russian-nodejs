@@ -10,7 +10,15 @@ import {
   RealtimeEvents,
 } from "@elevenlabs/elevenlabs-js";
 
-// ==== Env ====
+// ==== базовый лог ошибок процесса, чтобы сервер не падал молча ====
+process.on("uncaughtException", (err) => {
+  console.error("UNCAUGHT_EXCEPTION:", err);
+});
+process.on("unhandledRejection", (reason) => {
+  console.error("UNHANDLED_REJECTION:", reason);
+});
+
+// ==== ENV ====
 const PORT = process.env.PORT || 8000;
 
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
@@ -25,7 +33,7 @@ if (!ELEVENLABS_API_KEY) console.warn("ELEVENLABS_API_KEY is not set");
 if (!ELEVENLABS_VOICE_ID) console.warn("ELEVENLABS_VOICE_ID is not set");
 if (!OPENAI_API_KEY) console.warn("OPENAI_API_KEY is not set");
 
-// ==== Клиенты ====
+// ==== клиенты ====
 const eleven = new ElevenLabsClient({ apiKey: ELEVENLABS_API_KEY });
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
@@ -37,6 +45,8 @@ app.use(express.urlencoded({ extended: false }));
 app.post("/voice", (req, res) => {
   const host = req.headers["host"];
   const wsUrl = `wss://${host}/twilio-stream`;
+
+  console.log("[/voice] building TwiML with wsUrl=", wsUrl);
 
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -53,7 +63,7 @@ app.post("/voice", (req, res) => {
 const server = http.createServer(app);
 const wss = new WebSocketServer({ noServer: true });
 
-// ==== Мапы по streamSid ====
+// ==== мапы по streamSid ====
 /** @type {Map<string, ScribeSession>} */
 const sttSessions = new Map();
 /** @type {Map<string, LLMConversation>} */
@@ -82,7 +92,8 @@ wss.on("connection", (ws, req) => {
     let data;
     try {
       data = JSON.parse(raw.toString());
-    } catch {
+    } catch (e) {
+      console.error("Failed to parse WS JSON:", e);
       return;
     }
 
@@ -106,6 +117,8 @@ wss.on("connection", (ws, req) => {
         handleFinalTranscript
       );
       sttSessions.set(streamSid, scribe);
+
+      // НЕ await, чтобы не блокировать обработчик
       scribe.start().catch((err) =>
         console.error(`[${streamSid}] Scribe start error:`, err)
       );
@@ -184,17 +197,22 @@ class ScribeSession {
     /** @type {import("@elevenlabs/elevenlabs-js").RealtimeConnection | null} */
     this.connection = null;
 
-    this.ready = false;      // <= true ТОЛЬКО после SESSION_STARTED
+    this.ready = false;      // true только после SESSION_STARTED
     this.stopped = false;
-    this.buffer = [];        // копим аудио до готовности
+    this.buffer = [];        // base64-чанки, пришедшие до готовности
   }
 
   async start() {
     console.log(`[${this.streamSid}] Starting Scribe session`);
+    if (!ELEVENLABS_API_KEY) {
+      console.warn(`[${this.streamSid}] No ELEVENLABS_API_KEY, STT disabled`);
+      return;
+    }
+
     try {
       const conn = await this.client.speechToText.realtime.connect({
         modelId: "scribe_v2_realtime",
-        audioFormat: AudioFormat.ULAW_8000, // Twilio ulaw 8kHz
+        audioFormat: AudioFormat.ULAW_8000, // Twilio μ-law 8kHz
         sampleRate: 8000,
         commitStrategy: CommitStrategy.VAD,
         vadSilenceThresholdSecs: 0.5,
@@ -214,10 +232,9 @@ class ScribeSession {
           info.session_id
         );
 
-        // Теперь соединение реально готово принимать аудио
+        // теперь соединение готово принимать аудио
         this.ready = true;
 
-        // Сливаем буфер, который накопился до старта
         if (this.buffer.length) {
           console.log(
             `[${this.streamSid}] Flushing ${this.buffer.length} buffered audio chunks`
@@ -232,7 +249,6 @@ class ScribeSession {
               `[${this.streamSid}] Error sending buffered audio:`,
               err
             );
-            // при жёсткой ошибке можно прервать цикл
             break;
           }
         }
@@ -270,8 +286,6 @@ class ScribeSession {
         console.log(`[${this.streamSid}] Scribe connection closed`);
       });
     } catch (err) {
-      // Сюда должно попадать только что-то типа сетевой/авторизационной ошибки,
-      // а не нормальные "WebSocket is not connected" во время старта.
       console.error(`[${this.streamSid}] Failed to start Scribe:`, err);
     }
   }
@@ -283,14 +297,13 @@ class ScribeSession {
     if (this.stopped) return;
 
     if (this.connection && this.ready) {
-      // соединение уже в состоянии SESSION_STARTED
       try {
         this.connection.send({ audioBase64: payloadB64 });
       } catch (err) {
         console.error(`[${this.streamSid}] Scribe send error:`, err);
       }
     } else {
-      // Scribe ещё не готов — складываем в буфер
+      // Scribe ещё не готов — копим
       this.buffer.push(payloadB64);
     }
   }
@@ -311,7 +324,7 @@ class ScribeSession {
 class LLMConversation {
   constructor(streamSid) {
     this.streamSid = streamSid;
-    /** @type {{role: "system" | "user" | "assistant", content: string}[]} */
+    /** @type {{role:"system"|"user"|"assistant",content:string}[]} */
     this.messages = [
       {
         role: "system",
@@ -393,8 +406,6 @@ async function streamTtsToTwilio(streamSid, text) {
     text,
     modelId: ELEVENLABS_MODEL_ID,
     outputFormat: "ulaw_8000", // важно для Twilio
-    // можно добавить voiceSettings при необходимости
-    // voiceSettings: { stability: 0.5, similarityBoost: 0.0, useSpeakerBoost: true, style: 0, speakingRate: 1.3 }
   });
 
   for await (const chunk of ttsStream) {
