@@ -184,9 +184,9 @@ class ScribeSession {
     /** @type {import("@elevenlabs/elevenlabs-js").RealtimeConnection | null} */
     this.connection = null;
 
-    this.ready = false;
+    this.ready = false;      // <= true ТОЛЬКО после SESSION_STARTED
     this.stopped = false;
-    this.buffer = []; // чанки base64, пока соединение не готово
+    this.buffer = [];        // копим аудио до готовности
   }
 
   async start() {
@@ -194,24 +194,49 @@ class ScribeSession {
     try {
       const conn = await this.client.speechToText.realtime.connect({
         modelId: "scribe_v2_realtime",
-        audioFormat: AudioFormat.ULAW_8000, // Twilio даёт μ-law 8kHz
+        audioFormat: AudioFormat.ULAW_8000, // Twilio ulaw 8kHz
         sampleRate: 8000,
         commitStrategy: CommitStrategy.VAD,
         vadSilenceThresholdSecs: 0.5,
         vadThreshold: 0.4,
         minSpeechDurationMs: 100,
         minSilenceDurationMs: 150,
-        // languageCode не задаём — автоопределение
+        // languageCode не задаём -> автоопределение
       });
 
       this.connection = conn;
-      this.ready = true;
+
+      // --- события ElevenLabs Realtime ---
 
       conn.on(RealtimeEvents.SESSION_STARTED, (info) => {
         console.log(
           `[${this.streamSid}] Scribe session started:`,
           info.session_id
         );
+
+        // Теперь соединение реально готово принимать аудио
+        this.ready = true;
+
+        // Сливаем буфер, который накопился до старта
+        if (this.buffer.length) {
+          console.log(
+            `[${this.streamSid}] Flushing ${this.buffer.length} buffered audio chunks`
+          );
+        }
+
+        for (const payload of this.buffer) {
+          try {
+            conn.send({ audioBase64: payload });
+          } catch (err) {
+            console.error(
+              `[${this.streamSid}] Error sending buffered audio:`,
+              err
+            );
+            // при жёсткой ошибке можно прервать цикл
+            break;
+          }
+        }
+        this.buffer = [];
       });
 
       conn.on(RealtimeEvents.PARTIAL_TRANSCRIPT, (msg) => {
@@ -225,45 +250,47 @@ class ScribeSession {
         try {
           this.onFinal?.(this.streamSid, msg.text);
         } catch (e) {
-          console.error(
-            `[${this.streamSid}] onFinal callback error:`,
-            e
-          );
+          console.error(`[${this.streamSid}] onFinal callback error:`, e);
         }
       });
 
       conn.on(RealtimeEvents.ERROR, (err) => {
         console.error(`[${this.streamSid}] Scribe ERROR:`, err);
       });
+
       conn.on(RealtimeEvents.AUTH_ERROR, (err) => {
         console.error(`[${this.streamSid}] Scribe AUTH_ERROR:`, err);
       });
+
       conn.on(RealtimeEvents.QUOTA_EXCEEDED, (err) => {
         console.error(`[${this.streamSid}] Scribe QUOTA_EXCEEDED:`, err);
       });
+
       conn.on(RealtimeEvents.CLOSE, () => {
         console.log(`[${this.streamSid}] Scribe connection closed`);
       });
-
-      // отправляем то, что накопилось до готовности
-      for (const payload of this.buffer) {
-        conn.send({ audioBase64: payload });
-      }
-      this.buffer = [];
     } catch (err) {
+      // Сюда должно попадать только что-то типа сетевой/авторизационной ошибки,
+      // а не нормальные "WebSocket is not connected" во время старта.
       console.error(`[${this.streamSid}] Failed to start Scribe:`, err);
     }
   }
 
+  /**
+   * Получает base64 ulaw_8000 из Twilio и либо буферизует, либо сразу шлёт.
+   */
   sendAudio(payloadB64) {
     if (this.stopped) return;
-    if (this.ready && this.connection) {
+
+    if (this.connection && this.ready) {
+      // соединение уже в состоянии SESSION_STARTED
       try {
         this.connection.send({ audioBase64: payloadB64 });
       } catch (err) {
         console.error(`[${this.streamSid}] Scribe send error:`, err);
       }
     } else {
+      // Scribe ещё не готов — складываем в буфер
       this.buffer.push(payloadB64);
     }
   }
