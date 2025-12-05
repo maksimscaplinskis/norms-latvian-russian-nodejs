@@ -53,7 +53,7 @@ app.post('/voice', (req, res) => {
       language: 'lv-LV',
       voice: 'Google.lv-LV-Standard-B', // Twilio TTS для латышского :contentReference[oaicite:0]{index=0}
     },
-    'Labdien! Esmu virtuālais autoservisa palīgs. Pēc signāla sāciet runāt, un es mēģināšu visu pierakstīt.'
+    'Labdien! Esmu virtuālais autoservisa palīgs.'
   );
 
   const connect = twiml.connect();
@@ -229,9 +229,6 @@ wss.on('connection', async (twilioWs, req) => {
 
         const { sequenceNumber, media } = msg;
         const { timestamp, chunk, payload } = media || {};
-        console.log(
-          `[${streamSid}] 🎧 Twilio MEDIA: seq=${sequenceNumber}, ts=${timestamp}, chunk=${chunk}, hasPayload=${!!payload}`
-        );
 
         if (!payload) break;
 
