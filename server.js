@@ -9,6 +9,7 @@ import {
   CommitStrategy,
   RealtimeEvents,
 } from '@elevenlabs/elevenlabs-js';
+import fs from 'fs';
 
 // ==== Конфиг ====
 
@@ -85,6 +86,7 @@ wss.on('connection', async (twilioWs, req) => {
   let scribeConn = null;
   let scribeReady = false;
   const pendingAudioChunks = [];
+  let rawUlawChunks = [];
 
   // Безопасная отправка аудио в Scribe (с буферизацией до старта сессии)
   const safeSendToScribe = (payloadBase64) => {
@@ -116,13 +118,14 @@ wss.on('connection', async (twilioWs, req) => {
 
       scribeConn = await elevenClient.speechToText.realtime.connect({
         modelId: SCRIBE_MODEL_ID,
-        audioFormat: AudioFormat.ULAW_8000, // идеально под Twilio ulaw_8000 :contentReference[oaicite:1]{index=1}
+        audioFormat: AudioFormat.ULAW_8000,
         sampleRate: 8000,
         commitStrategy: CommitStrategy.VAD,
         vadSilenceThresholdSecs: 0.5,
-        vadThreshold: 0.4,
-        minSpeechDurationMs: 100,
-        minSilenceDurationMs: 100,
+        vadThreshold: 0.3,          // чуть более чувствительный VAD
+        minSpeechDurationMs: 150,
+        minSilenceDurationMs: 150,
+        languageCode: 'ru',         // ВАЖНО: говори по-русски в тесте
         includeTimestamps: true,
       });
 
@@ -231,8 +234,13 @@ wss.on('connection', async (twilioWs, req) => {
 
         const { sequenceNumber, media } = msg;
         const { timestamp, chunk, payload } = media || {};
-
         if (!payload) break;
+
+        const buf = Buffer.from(payload, 'base64');
+        console.log(
+          `[${streamSid}] Twilio MEDIA seq=${sequenceNumber}, ts=${timestamp}, bytes=${buf.length}`
+        );
+        rawUlawChunks.push(buf);
 
         // payload — уже base64 ulaw 8000 от Twilio → отправляем как есть
         safeSendToScribe(payload);
@@ -244,6 +252,16 @@ wss.on('connection', async (twilioWs, req) => {
         if (scribeConn) {
           scribeConn.close();
           scribeConn = null;
+        }
+        if (rawUlawChunks.length) {
+          const rawPath = `/tmp/${streamSid || 'unknown'}-twilio-ulaw8k.raw`;
+          fs.writeFile(rawPath, Buffer.concat(rawUlawChunks), (err) => {
+            if (err) {
+              console.error(`[${streamSid}] ❌ Failed to write raw audio:`, err);
+            } else {
+              console.log(`[${streamSid}] 💾 Saved raw Twilio audio to ${rawPath}`);
+            }
+          });
         }
         twilioWs.close();
         break;
