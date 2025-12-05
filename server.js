@@ -57,12 +57,8 @@ app.post('/voice', (req, res) => {
   );
 
   const connect = twiml.connect();
-  connect.stream({
-    url: wsUrl,
-    parameters: [
-      { name: 'botSession', value: 'car-assistant' },
-    ],
-  });
+  const stream = connect.stream({ url: wsUrl });
+  stream.parameter({ name: 'botSession', value: 'car-assistant' });
 
   const twimlStr = twiml.toString();
   console.log('[/voice] Responding with TwiML:\n', twimlStr);
@@ -97,7 +93,10 @@ wss.on('connection', async (twilioWs, req) => {
       return;
     }
     try {
-      scribeConn.send({ audioBase64: payloadBase64 });
+      scribeConn.send({
+        audioBase64: payloadBase64,
+        sampleRate: 8000, // ВАЖНО: Twilio всегда 8000 Hz
+      });
     } catch (err) {
       console.error(`[${streamSid}] ❌ Error sending audio to Scribe:`, err);
     }
@@ -144,7 +143,10 @@ wss.on('connection', async (twilioWs, req) => {
             `[${streamSid}] Sending ${pendingAudioChunks.length} buffered audio chunks to Scribe`
           );
           for (const chunk of pendingAudioChunks) {
-            scribeConn.send({ audioBase64: chunk });
+            scribeConn.send({
+              audioBase64: chunk,
+              sampleRate: 8000, // тоже явно указываем
+            });
           }
           pendingAudioChunks.length = 0;
         }
