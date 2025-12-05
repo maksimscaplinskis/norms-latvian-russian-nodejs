@@ -36,7 +36,7 @@ if (!OPENAI_API_KEY) console.warn("OPENAI_API_KEY is not set");
 
 // ==== клиенты ====
 const elevenClient = new ElevenLabsClient({
-  apiKey: process.env.ELEVENLABS_API_KEY,
+  apiKey: ELEVENLABS_API_KEY,
 });
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
@@ -69,19 +69,16 @@ const wss = new WebSocketServer({ noServer: true });
 const logger = {
   info: (...args) => console.log(...args),
   error: (...args) => console.error(...args),
-  warn:  (...args) => console.warn(...args),
+  warn: (...args) => console.warn(...args),
 };
 
 // ==== мапы по streamSid ====
-/** @type {Map<string, ScribeSession>} */
-const sttSessions = new Map();
-/** @type {Map<string, LLMConversation>} */
+/** streamSid -> ScribeSession */
+const scribeSessions = new Map();
+/** streamSid -> LLMConversation */
 const llmSessions = new Map();
-/** @type {Map<string, WebSocket>} */
+/** streamSid -> WebSocket (Twilio) */
 const twilioSockets = new Map();
-
-const scribeSessions = new Map(); // streamSid -> ScribeSession
-const conversations = new Map(); // streamSid -> message[]
 
 // upgrade -> /twilio-stream
 server.on("upgrade", (req, socket, head) => {
@@ -97,8 +94,10 @@ server.on("upgrade", (req, socket, head) => {
 
 // ==== WebSocket handler для Twilio Media Streams ====
 wss.on("connection", (ws, req) => {
-  console.log("Twilio WS connected");
-  let streamSid = null;
+  logger.info("Twilio WS connected");
+
+  // текущий streamSid для этого WS-соединения
+  let currentStreamSid = null;
 
   ws.on("message", async (message) => {
     try {
@@ -112,29 +111,32 @@ wss.on("connection", (ws, req) => {
       }
 
       if (event === "start") {
-        const streamSid = data.start.streamSid;
+        // у start streamSid обычно лежит в data.start.streamSid
+        currentStreamSid = data.start?.streamSid || data.streamSid;
+        const streamSid = currentStreamSid;
         logger.info(`Twilio stream START: ${streamSid}`);
 
         // --- запуск Scribe-сессии ---
         const scribe = new ScribeSession(streamSid);
         scribeSessions.set(streamSid, scribe);
+        twilioSockets.set(streamSid, ws);
+
         scribe.start().catch((err) => {
           logger.error(
             `[${streamSid}] Scribe start failed: ${err.stack || err}`
           );
         });
 
-        twilioSockets.set(streamSid, ws);
-
-        // приветствие (TTS) — см. ниже
+        // приветствие
         streamTtsToTwilio(streamSid, greetingText).catch((err) => {
           console.error(`[${streamSid}] Error sending greeting TTS:`, err);
         });
+
         return;
       }
 
       if (event === "media") {
-        const streamSid = data.streamSid;
+        const streamSid = data.streamSid || currentStreamSid;
         const payloadBase64 = data.media?.payload;
 
         if (!payloadBase64) {
@@ -145,19 +147,26 @@ wss.on("connection", (ws, req) => {
         }
 
         const scribe = scribeSessions.get(streamSid);
-        if (scribe) {
-          scribe.sendAudio(payloadBase64);
-        } else {
+        if (!scribe) {
           logger.warn(
             `[${streamSid}] Media received but no ScribeSession found`
           );
+          return;
         }
 
+        // Отладка: видно, что аудио реально идёт
+        // Можно потом убрать/закомментировать
+        logger.info(
+          `[${streamSid}] Media chunk received, len=${payloadBase64.length}`
+        );
+
+        scribe.sendAudio(payloadBase64);
         return;
       }
 
       if (event === "stop") {
-        const streamSid = data.stop.streamSid;
+        // у stop streamSid лежит в data.streamSid
+        const streamSid = data.streamSid || currentStreamSid;
         logger.info(`Twilio stream STOP: ${streamSid}`);
 
         const scribe = scribeSessions.get(streamSid);
@@ -166,33 +175,33 @@ wss.on("connection", (ws, req) => {
           scribeSessions.delete(streamSid);
         }
 
-        // тут же можешь чистить LLM-сессии и т.п.
+        twilioSockets.delete(streamSid);
+        llmSessions.delete(streamSid);
         return;
       }
 
       // остальные события Twilio (mark и т.п.)
       logger.info(`Twilio event=${event} (ignored)`);
-
     } catch (err) {
       logger.error("Error in Twilio WS message handler:", err);
     }
   });
 
   ws.on("close", () => {
-    console.log("Twilio WS closed");
-    if (streamSid) {
-      const scribe = sttSessions.get(streamSid);
-      if (scribe) {
-        scribe.stop();
-        sttSessions.delete(streamSid);
-      }
-      twilioSockets.delete(streamSid);
-      llmSessions.delete(streamSid);
+    logger.info("Twilio WS closed");
+    if (!currentStreamSid) return;
+
+    const scribe = scribeSessions.get(currentStreamSid);
+    if (scribe) {
+      scribe.close();
+      scribeSessions.delete(currentStreamSid);
     }
+    twilioSockets.delete(currentStreamSid);
+    llmSessions.delete(currentStreamSid);
   });
 
   ws.on("error", (err) => {
-    console.error("WS error:", err);
+    logger.error("WS error:", err);
   });
 });
 
@@ -213,7 +222,7 @@ class ScribeSession {
       this.connection = await elevenClient.speechToText.realtime.connect({
         modelId: "scribe_v2_realtime",
         audioFormat: AudioFormat.ULAW_8000, // важно!
-        sampleRate: 8000,                   // тоже важно!
+        sampleRate: 8000, // тоже важно!
         commitStrategy: CommitStrategy.VAD, // пусть сам режет по тишине
         // languageCode НЕ задаем -> авто-детект RU/LV
         vadSilenceThresholdSecs: 0.5,
@@ -261,10 +270,9 @@ class ScribeSession {
         );
 
         // language_code может быть в data.language_code
-        const langCode =
-          data.language_code || data.languageCode || null;
+        const langCode = data.language_code || data.languageCode || null;
 
-        // тут дергаем твой LLM+TTS пайплайн
+        // дергаем LLM+TTS пайплайн
         handleFinalUserUtterance(this.streamSid, data.text, langCode);
       });
 
@@ -335,6 +343,8 @@ class ScribeSession {
 class LLMConversation {
   constructor(streamSid) {
     this.streamSid = streamSid;
+    this.langCode = null;
+
     /** @type {{role:"system"|"user"|"assistant",content:string}[]} */
     this.messages = [
       {
@@ -353,15 +363,18 @@ class LLMConversation {
     ];
   }
 
-  async reply(userText) {
+  async reply(userText, langCodeFromStt) {
+    if (langCodeFromStt && !this.langCode) {
+      this.langCode = langCodeFromStt;
+    }
+
     this.messages.push({ role: "user", content: userText });
 
     const completion = await openai.chat.completions.create({
       model: OPENAI_MODEL,
       messages: this.messages,
-      max_completion_tokens: 80,
+      max_tokens: 80,
       temperature: 0.4,
-      reasoning_effort: "none",
     });
 
     const reply =
@@ -371,51 +384,31 @@ class LLMConversation {
       this.messages.push({ role: "assistant", content: reply });
     }
 
-    console.log(`[${this.streamSid}] LLM reply:`, reply);
+    logger.info(`[${this.streamSid}] LLM reply: ${reply}`);
     return reply;
   }
 }
 
 // ==== Обработка финального транскрипта от Scribe ====
-function getConversation(streamSid) {
-  if (!conversations.has(streamSid)) {
-    const systemPrompt =
-      "Tu esi auto servisa balss asistents. " +
-      "Sākumā uzmanīgi noklausies klienta problēmu. " +
-      "Pēc pirmajiem vārdiem nosaki, vai klients runā latviski vai krieviski, un turpmāk runā tikai šajā valodā. " +
-      "Runā īsiem, vienkāršiem teikumiem, ne vairāk kā divi teikumi vienlaikus. " +
-      "Kad saproti problēmu, piedāvā pierakstu uz auto pārbaudi un palīdz izvēlēties dienu un laiku. " +
-      "Kad pieraksts apstiprināts, pateicies un pieklājīgi nobeidz sarunu. " +
-      "Neprasi tehniskas detaļas par auto, tikai to, kas nepieciešams pierakstam.";
-
-    conversations.set(streamSid, [{ role: "system", content: systemPrompt }]);
-  }
-  return conversations.get(streamSid);
-}
-
 async function handleFinalUserUtterance(streamSid, text, langCode) {
   logger.info(
     `[${streamSid}] Final transcript for LLM [langCode=${langCode}]: ${text}`
   );
 
-  // 1) Берем/создаем LLMConversation (ты уже делал в Python)
-  let conv = llmSessions[streamSid];
+  let conv = llmSessions.get(streamSid);
   if (!conv) {
     conv = new LLMConversation(streamSid);
-    llmSessions[streamSid] = conv;
+    llmSessions.set(streamSid, conv);
   }
 
-  const replyText = await conv.handleUserUtterance(text, langCode);
+  const replyText = await conv.reply(text, langCode);
 
-  if (!replyText) {
-    return;
-  }
+  if (!replyText) return;
 
   logger.info(
     `[${streamSid}] LLM reply ready (for TTS): ${JSON.stringify(replyText)}`
   );
 
-  // 2) Прогоняем через ElevenLabs TTS и отправляем в Twilio
   await streamTtsToTwilio(streamSid, replyText);
 }
 
@@ -435,9 +428,11 @@ async function streamTtsToTwilio(streamSid, text) {
     return;
   }
 
-  console.log(`[${streamSid}] TTS: sending text to ElevenLabs (${text.length} chars)`);
+  logger.info(
+    `[${streamSid}] TTS: sending text to ElevenLabs (${text.length} chars)`
+  );
 
-  const voiceId = process.env.ELEVENLABS_VOICE_ID;
+  const voiceId = ELEVENLABS_VOICE_ID;
   const modelId = process.env.ELEVENLABS_TTS_MODEL_ID || "eleven_flash_v2_5";
 
   // 1) Получаем весь аудио-стрим целиком (ulaw_8000)
@@ -463,21 +458,13 @@ async function streamTtsToTwilio(streamSid, text) {
     })
   );
 
-  console.log(
+  logger.info(
     `[${streamSid}] TTS: sent ${audioBuffer.length} bytes of ulaw_8000 to Twilio`
   );
 }
 
-// где-то рядом:
 const greetingText =
   "Labdien! Esmu virtuālais autoservisa palīgs. Lūdzu, īsi pastāstiet, kāda ir problēma ar auto.";
-
-// Приветствие в начале звонка (если нужно)
-async function sendGreeting(streamSid) {
-  const greeting =
-    "Labdien! Esmu virtuālais autoservisa palīgs.";
-  await streamTtsToTwilio(streamSid, greeting);
-}
 
 // ==== Start server ====
 server.listen(PORT, () => {
