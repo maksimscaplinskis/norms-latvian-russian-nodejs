@@ -64,6 +64,12 @@ app.post("/voice", (req, res) => {
 const server = http.createServer(app);
 const wss = new WebSocketServer({ noServer: true });
 
+const logger = {
+  info: (...args) => console.log(...args),
+  error: (...args) => console.error(...args),
+  warn:  (...args) => console.warn(...args),
+};
+
 // ==== мапы по streamSid ====
 /** @type {Map<string, ScribeSession>} */
 const sttSessions = new Map();
@@ -92,47 +98,81 @@ wss.on("connection", (ws, req) => {
   console.log("Twilio WS connected");
   let streamSid = null;
 
-  ws.on("message", async (data) => {
-    const msg = JSON.parse(data.toString());
-    const event = msg.event;
+  ws.on("message", async (message) => {
+    try {
+      const jsonStr = message.toString("utf8");
+      const data = JSON.parse(jsonStr);
+      const event = data.event;
 
-    if (event === "connected") {
-      console.log("Twilio event=connected");
-    } else if (event === "start") {
-      const streamSid = msg.start.streamSid;
-      console.log(`Twilio stream START: ${streamSid}`);
-
-      twilioSockets.set(streamSid, ws);
-
-      // стартуем Scribe для этого streamSid
-      const scribe = new ScribeSession(streamSid);
-      scribeSessions.set(streamSid, scribe);
-      scribe.start().catch((err) => {
-        logger.error(`[${streamSid}] Scribe start failed: ${err.stack || err}`);
-      });
-
-      // приветствие (TTS) — см. ниже
-      streamTtsToTwilio(streamSid, greetingText).catch((err) => {
-        console.error(`[${streamSid}] Error sending greeting TTS:`, err);
-      });
-    } else if (event === "media") {
-      const streamSid = data.streamSid;
-      const payloadBase64 = data.media.payload; // уже base64
-
-      const scribe = scribeSessions.get(streamSid);
-      if (scribe) {
-        scribe.sendAudio(payloadBase64);
+      if (event === "connected") {
+        logger.info("Twilio event=connected");
+        return;
       }
-    } else if (event === "stop") {
-      const streamSid = msg.streamSid;
-      console.log(`Twilio stream STOP: ${streamSid}`);
 
-      const scribe = scribeSessions.get(streamSid);
-      if (scribe) {
-        scribe.close();
-        scribeSessions.delete(streamSid);
+      if (event === "start") {
+        const streamSid = data.start.streamSid;
+        logger.info(`Twilio stream START: ${streamSid}`);
+
+        // --- запуск Scribe-сессии ---
+        const scribe = new ScribeSession(streamSid);
+        scribeSessions.set(streamSid, scribe);
+        scribe.start().catch((err) => {
+          logger.error(
+            `[${streamSid}] Scribe start failed: ${err.stack || err}`
+          );
+        });
+
+        twilioSockets.set(streamSid, ws);
+
+        // приветствие (TTS) — см. ниже
+        streamTtsToTwilio(streamSid, greetingText).catch((err) => {
+          console.error(`[${streamSid}] Error sending greeting TTS:`, err);
+        });
+        return;
       }
-      twilioSockets.delete(streamSid);
+
+      if (event === "media") {
+        const streamSid = data.streamSid;
+        const payloadBase64 = data.media?.payload;
+
+        if (!payloadBase64) {
+          logger.warn(
+            `[${streamSid || "noSid"}] Media event without payload: ${jsonStr}`
+          );
+          return;
+        }
+
+        const scribe = scribeSessions.get(streamSid);
+        if (scribe) {
+          scribe.sendAudio(payloadBase64);
+        } else {
+          logger.warn(
+            `[${streamSid}] Media received but no ScribeSession found`
+          );
+        }
+
+        return;
+      }
+
+      if (event === "stop") {
+        const streamSid = data.stop.streamSid;
+        logger.info(`Twilio stream STOP: ${streamSid}`);
+
+        const scribe = scribeSessions.get(streamSid);
+        if (scribe) {
+          scribe.close();
+          scribeSessions.delete(streamSid);
+        }
+
+        // тут же можешь чистить LLM-сессии и т.п.
+        return;
+      }
+
+      // остальные события Twilio (mark и т.п.)
+      logger.info(`Twilio event=${event} (ignored)`);
+
+    } catch (err) {
+      logger.error("Error in Twilio WS message handler:", err);
     }
   });
 
