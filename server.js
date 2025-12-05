@@ -9,6 +9,7 @@ import {
   CommitStrategy,
   RealtimeEvents,
 } from "@elevenlabs/elevenlabs-js";
+import { Readable } from "stream";
 
 // ==== базовый лог ошибок процесса, чтобы сервер не падал молча ====
 process.on("uncaughtException", (err) => {
@@ -71,6 +72,9 @@ const llmSessions = new Map();
 /** @type {Map<string, WebSocket>} */
 const twilioSockets = new Map();
 
+const scribeSessions = new Map(); // streamSid -> ScribeSession
+const conversations = new Map(); // streamSid -> message[]
+
 // upgrade -> /twilio-stream
 server.on("upgrade", (req, socket, head) => {
   const url = req.url || "";
@@ -88,80 +92,48 @@ wss.on("connection", (ws, req) => {
   console.log("Twilio WS connected");
   let streamSid = null;
 
-  ws.on("message", async (raw) => {
-    let data;
-    try {
-      data = JSON.parse(raw.toString());
-    } catch (e) {
-      console.error("Failed to parse WS JSON:", e);
-      return;
-    }
-
-    const event = data.event;
+  ws.on("message", async (data) => {
+    const msg = JSON.parse(data.toString());
+    const event = msg.event;
 
     if (event === "connected") {
       console.log("Twilio event=connected");
-      return;
-    }
-
-    if (event === "start") {
-      streamSid = data.start.streamSid;
-      console.log("Twilio stream START:", streamSid);
+    } else if (event === "start") {
+      const streamSid = msg.start.streamSid;
+      console.log(`Twilio stream START: ${streamSid}`);
 
       twilioSockets.set(streamSid, ws);
 
-      // STT сессия ElevenLabs Scribe
-      const scribe = new ScribeSession(
-        streamSid,
-        eleven,
-        handleFinalTranscript
-      );
-      sttSessions.set(streamSid, scribe);
+      // стартуем Scribe для этого streamSid
+      const session = new ScribeSession(streamSid);
+      scribeSessions.set(streamSid, session);
+      session.start().catch((err) => {
+        console.error(`[${streamSid}] Failed to start Scribe:`, err);
+      });
 
-      // НЕ await, чтобы не блокировать обработчик
-      scribe.start().catch((err) =>
-        console.error(`[${streamSid}] Scribe start error:`, err)
-      );
+      // приветствие (TTS) — см. ниже
+      streamTtsToTwilio(streamSid, greetingText).catch((err) => {
+        console.error(`[${streamSid}] Error sending greeting TTS:`, err);
+      });
+    } else if (event === "media") {
+      const streamSid = msg.streamSid;
+      const payloadBase64 = msg.media.payload;
 
-      // Приветствие (опционально)
-      sendGreeting(streamSid).catch((err) =>
-        console.error(`[${streamSid}] Greeting error:`, err)
-      );
-
-      return;
-    }
-
-    if (event === "media") {
-      if (!streamSid) return;
-      const payloadB64 = data.media.payload;
-
-      const scribe = sttSessions.get(streamSid);
-      if (scribe) {
-        scribe.sendAudio(payloadB64);
+      const session = scribeSessions.get(streamSid);
+      if (session) {
+        session.sendAudioBase64(payloadBase64);
       }
-      return;
-    }
+    } else if (event === "stop") {
+      const streamSid = msg.streamSid;
+      console.log(`Twilio stream STOP: ${streamSid}`);
 
-    if (event === "stop") {
-      console.log("Twilio stream STOP:", streamSid);
-
-      if (streamSid) {
-        const scribe = sttSessions.get(streamSid);
-        if (scribe) {
-          scribe.stop();
-          sttSessions.delete(streamSid);
-        }
-        twilioSockets.delete(streamSid);
-        llmSessions.delete(streamSid);
+      const session = scribeSessions.get(streamSid);
+      if (session) {
+        session.stop();
+        scribeSessions.delete(streamSid);
       }
-
-      try {
-        ws.close();
-      } catch {}
-      return;
+      twilioSockets.delete(streamSid);
     }
-
-    console.log("Unknown Twilio event:", event);
   });
 
   ws.on("close", () => {
@@ -182,141 +154,143 @@ wss.on("connection", (ws, req) => {
   });
 });
 
-// ==== ScribeSession: ElevenLabs STT на один streamSid ====
+// ==================== Scribe STT session ====================
+
 class ScribeSession {
-  /**
-   * @param {string} streamSid
-   * @param {ElevenLabsClient} client
-   * @param {(sid: string, text: string) => void | Promise<void>} onFinal
-   */
-  constructor(streamSid, client, onFinal) {
+  constructor(streamSid) {
     this.streamSid = streamSid;
-    this.client = client;
-    this.onFinal = onFinal;
-
-    /** @type {import("@elevenlabs/elevenlabs-js").RealtimeConnection | null} */
     this.connection = null;
-
-    this.ready = false;      // true только после SESSION_STARTED
-    this.stopped = false;
-    this.buffer = [];        // base64-чанки, пришедшие до готовности
+    this.ready = false;
+    this.buffer = [];          // сюда временно складываем аудио
+    this.transcript = "";      // общий текст для логов/отладки
   }
 
   async start() {
     console.log(`[${this.streamSid}] Starting Scribe session`);
-    if (!ELEVENLABS_API_KEY) {
-      console.warn(`[${this.streamSid}] No ELEVENLABS_API_KEY, STT disabled`);
+
+    this.connection = await eleven.speechToText.realtime.connect({
+      modelId: "scribe_v2_realtime",
+      audioFormat: AudioFormat.ULAW_8000,
+      sampleRate: 8000,
+      commitStrategy: CommitStrategy.VAD,  // авто-коммиты по VAD
+      vadSilenceThresholdSecs: 0.5,
+      vadThreshold: 0.5,
+      includeTimestamps: false,
+      // languageCode можно не задавать — Scribe сам детектит язык
+    });
+
+    // --- регистрируем события ---
+
+    this.connection.on(RealtimeEvents.SESSION_STARTED, (data) => {
+      console.log(
+        `[${this.streamSid}] Scribe session started: ${data.session_id}`
+      );
+
+      // важно: сначала включаем ready, потом льём буфер
+      this.ready = true;
+
+      if (this.buffer.length > 0) {
+        console.log(
+          `[${this.streamSid}] Flushing ${this.buffer.length} buffered audio chunks`
+        );
+        for (const base64 of this.buffer) {
+          try {
+            this.connection.send({ audioBase64: base64 });
+          } catch (err) {
+            console.error(
+              `[${this.streamSid}] Error sending buffered chunk to Scribe:`,
+              err
+            );
+          }
+        }
+        this.buffer = [];
+      }
+    });
+
+    this.connection.on(RealtimeEvents.PARTIAL_TRANSCRIPT, (data) => {
+      if (!data?.text) return;
+      console.log(
+        `[${this.streamSid}] Scribe partial: ${JSON.stringify(data)}`
+      );
+    });
+
+    this.connection.on(RealtimeEvents.COMMITTED_TRANSCRIPT, async (data) => {
+      if (!data?.text) return;
+
+      console.log(
+        `[${this.streamSid}] Scribe final: ${data.text} (lang=${data.language_code})`
+      );
+      this.transcript += (this.transcript ? " " : "") + data.text;
+
+      // здесь вызываем LLM + TTS
+      try {
+        const replyText = await handleFinalTranscript(
+          this.streamSid,
+          data.text,
+          data.language_code
+        );
+        if (replyText) {
+          console.log(
+            `[${this.streamSid}] LLM reply ready: ${replyText.replace(
+              /\s+/g,
+              " "
+            )}`
+          );
+          await streamTtsToTwilio(this.streamSid, replyText);
+        }
+      } catch (err) {
+        console.error(
+          `[${this.streamSid}] Error in LLM/TTS pipeline:`,
+          err
+        );
+      }
+    });
+
+    this.connection.on(RealtimeEvents.ERROR, (err) => {
+      console.error(`[${this.streamSid}] Scribe ERROR:`, err);
+    });
+
+    this.connection.on(RealtimeEvents.AUTH_ERROR, (err) => {
+      console.error(`[${this.streamSid}] Scribe AUTH_ERROR:`, err);
+    });
+
+    this.connection.on(RealtimeEvents.QUOTA_EXCEEDED, (err) => {
+      console.error(`[${this.streamSid}] Scribe QUOTA_EXCEEDED:`, err);
+    });
+
+    this.connection.on(RealtimeEvents.CLOSE, () => {
+      console.log(`[${this.streamSid}] Scribe connection closed`);
+    });
+  }
+
+  /**
+   * Получает base64 μ-law/8000 от Twilio и отправляет в Scribe.
+   * До старта сессии просто копит в буфере.
+   */
+  sendAudioBase64(base64Payload) {
+    if (!this.connection || !this.ready) {
+      this.buffer.push(base64Payload);
       return;
     }
 
     try {
-      const conn = await this.client.speechToText.realtime.connect({
-        modelId: "scribe_v2_realtime",
-        audioFormat: AudioFormat.ULAW_8000, // Twilio μ-law 8kHz
-        sampleRate: 8000,
-        commitStrategy: CommitStrategy.VAD,
-        vadSilenceThresholdSecs: 0.5,
-        vadThreshold: 0.4,
-        minSpeechDurationMs: 100,
-        minSilenceDurationMs: 150,
-        // languageCode не задаём -> автоопределение
-      });
-
-      this.connection = conn;
-
-      // --- события ElevenLabs Realtime ---
-
-      conn.on(RealtimeEvents.SESSION_STARTED, (info) => {
-        console.log(
-          `[${this.streamSid}] Scribe session started:`,
-          info.session_id
-        );
-
-        // теперь соединение готово принимать аудио
-        this.ready = true;
-
-        if (this.buffer.length) {
-          console.log(
-            `[${this.streamSid}] Flushing ${this.buffer.length} buffered audio chunks`
-          );
-        }
-
-        for (const payload of this.buffer) {
-          try {
-            conn.send({ audioBase64: payload });
-          } catch (err) {
-            console.error(
-              `[${this.streamSid}] Error sending buffered audio:`,
-              err
-            );
-            break;
-          }
-        }
-        this.buffer = [];
-      });
-
-      conn.on(RealtimeEvents.PARTIAL_TRANSCRIPT, (msg) => {
-        if (!msg?.text) return;
-        console.log(`[${this.streamSid}] STT partial:`, msg.text);
-      });
-
-      conn.on(RealtimeEvents.COMMITTED_TRANSCRIPT, (msg) => {
-        if (!msg?.text) return;
-        console.log(`[${this.streamSid}] STT final:`, msg.text);
-        try {
-          this.onFinal?.(this.streamSid, msg.text);
-        } catch (e) {
-          console.error(`[${this.streamSid}] onFinal callback error:`, e);
-        }
-      });
-
-      conn.on(RealtimeEvents.ERROR, (err) => {
-        console.error(`[${this.streamSid}] Scribe ERROR:`, err);
-      });
-
-      conn.on(RealtimeEvents.AUTH_ERROR, (err) => {
-        console.error(`[${this.streamSid}] Scribe AUTH_ERROR:`, err);
-      });
-
-      conn.on(RealtimeEvents.QUOTA_EXCEEDED, (err) => {
-        console.error(`[${this.streamSid}] Scribe QUOTA_EXCEEDED:`, err);
-      });
-
-      conn.on(RealtimeEvents.CLOSE, () => {
-        console.log(`[${this.streamSid}] Scribe connection closed`);
-      });
+      this.connection.send({ audioBase64: base64Payload });
     } catch (err) {
-      console.error(`[${this.streamSid}] Failed to start Scribe:`, err);
-    }
-  }
-
-  /**
-   * Получает base64 ulaw_8000 из Twilio и либо буферизует, либо сразу шлёт.
-   */
-  sendAudio(payloadB64) {
-    if (this.stopped) return;
-
-    if (this.connection && this.ready) {
-      try {
-        this.connection.send({ audioBase64: payloadB64 });
-      } catch (err) {
-        console.error(`[${this.streamSid}] Scribe send error:`, err);
-      }
-    } else {
-      // Scribe ещё не готов — копим
-      this.buffer.push(payloadB64);
+      console.error(
+        `[${this.streamSid}] Scribe send error:`,
+        err
+      );
     }
   }
 
   stop() {
-    this.stopped = true;
-    if (this.connection) {
-      try {
+    try {
+      if (this.connection) {
         this.connection.close();
-      } catch {}
-      this.connection = null;
+      }
+    } catch (err) {
+      console.error(`[${this.streamSid}] Error closing Scribe:`, err);
     }
-    this.buffer = [];
   }
 }
 
@@ -366,72 +340,109 @@ class LLMConversation {
 }
 
 // ==== Обработка финального транскрипта от Scribe ====
-async function handleFinalTranscript(streamSid, text) {
-  const normalized = text.trim();
-  if (!normalized) return;
+function getConversation(streamSid) {
+  if (!conversations.has(streamSid)) {
+    const systemPrompt =
+      "Tu esi auto servisa balss asistents. " +
+      "Sākumā uzmanīgi noklausies klienta problēmu. " +
+      "Pēc pirmajiem vārdiem nosaki, vai klients runā latviski vai krieviski, un turpmāk runā tikai šajā valodā. " +
+      "Runā īsiem, vienkāršiem teikumiem, ne vairāk kā divi teikumi vienlaikus. " +
+      "Kad saproti problēmu, piedāvā pierakstu uz auto pārbaudi un palīdz izvēlēties dienu un laiku. " +
+      "Kad pieraksts apstiprināts, pateicies un pieklājīgi nobeidz sarunu. " +
+      "Neprasi tehniskas detaļas par auto, tikai to, kas nepieciešams pierakstam.";
 
-  let conv = llmSessions.get(streamSid);
-  if (!conv) {
-    conv = new LLMConversation(streamSid);
-    llmSessions.set(streamSid, conv);
+    conversations.set(streamSid, [{ role: "system", content: systemPrompt }]);
+  }
+  return conversations.get(streamSid);
+}
+
+async function handleFinalTranscript(streamSid, text, languageCode) {
+  const messages = getConversation(streamSid);
+
+  messages.push({
+    role: "user",
+    content: text,
+  });
+
+  const stream = await openai.chat.completions.create({
+    model: OPENAI_MODEL,
+    messages,
+    max_completion_tokens: 80,
+    temperature: 0.4,
+    stream: true,
+  });
+
+  let reply = "";
+  for await (const chunk of stream) {
+    const delta = chunk.choices?.[0]?.delta?.content || "";
+    if (delta) reply += delta;
   }
 
-  try {
-    const replyText = await conv.reply(normalized);
-    if (replyText) {
-      await streamTtsToTwilio(streamSid, replyText);
-    }
-  } catch (err) {
-    console.error(`[${streamSid}] handleFinalTranscript error:`, err);
-  }
+  reply = reply.trim();
+  if (!reply) return "";
+
+  messages.push({ role: "assistant", content: reply });
+
+  return reply;
 }
 
 // ==== ElevenLabs TTS -> Twilio Media Stream ====
+async function bufferFromIterable(iterable) {
+  const chunks = [];
+  for await (const chunk of iterable) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  return Buffer.concat(chunks);
+}
+
 async function streamTtsToTwilio(streamSid, text) {
   const ws = twilioSockets.get(streamSid);
-  if (!ws || ws.readyState !== WebSocket.OPEN) {
-    console.warn(`[${streamSid}] No WS for TTS`);
-    return;
-  }
-  if (!ELEVENLABS_VOICE_ID) {
-    console.warn(`[${streamSid}] ELEVENLABS_VOICE_ID not set, skip TTS`);
+  if (!ws) {
+    console.warn(`[${streamSid}] No Twilio WS for TTS`);
     return;
   }
 
-  console.log(
-    `[${streamSid}] TTS: sending text to ElevenLabs (${text.length} chars)`
-  );
+  console.log(`[${streamSid}] TTS: sending text to ElevenLabs (${text.length} chars)`);
 
-  const ttsStream = await eleven.textToSpeech.stream(ELEVENLABS_VOICE_ID, {
+  const voiceId = process.env.ELEVENLABS_VOICE_ID;
+  const modelId = process.env.ELEVENLABS_TTS_MODEL_ID || "eleven_flash_v2_5";
+
+  // 1) Получаем весь аудио-стрим целиком (ulaw_8000)
+  const response = await eleven.textToSpeech.convert(voiceId, {
+    modelId,
+    outputFormat: "ulaw_8000",
     text,
-    modelId: ELEVENLABS_MODEL_ID,
-    outputFormat: "ulaw_8000", // важно для Twilio
   });
 
-  for await (const chunk of ttsStream) {
-    if (!ws || ws.readyState !== WebSocket.OPEN) break;
-    if (!Buffer.isBuffer(chunk)) continue;
+  const readable = Readable.from(response);
+  const audioBuffer = await bufferFromIterable(readable);
 
-    const payloadB64 = chunk.toString("base64");
-    const msg = {
+  const payload = audioBuffer.toString("base64");
+
+  // 2) Отправляем в Twilio одним куском
+  ws.send(
+    JSON.stringify({
       event: "media",
       streamSid,
-      media: { payload: payloadB64 },
-    };
+      media: {
+        payload,
+      },
+    })
+  );
 
-    try {
-      ws.send(JSON.stringify(msg));
-    } catch (err) {
-      console.error(`[${streamSid}] Error sending TTS chunk:`, err);
-      break;
-    }
-  }
+  console.log(
+    `[${streamSid}] TTS: sent ${audioBuffer.length} bytes of ulaw_8000 to Twilio`
+  );
 }
+
+// где-то рядом:
+const greetingText =
+  "Labdien! Esmu virtuālais autoservisa palīgs. Lūdzu, īsi pastāstiet, kāda ir problēma ar auto.";
 
 // Приветствие в начале звонка (если нужно)
 async function sendGreeting(streamSid) {
   const greeting =
-    "Labdien! Esmu virtuālais autoservisa palīgs. Pastāstiet, lūdzu, kas notiek ar auto.";
+    "Labdien! Esmu virtuālais autoservisa palīgs.";
   await streamTtsToTwilio(streamSid, greeting);
 }
 
