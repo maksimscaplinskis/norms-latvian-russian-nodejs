@@ -35,7 +35,9 @@ if (!ELEVENLABS_VOICE_ID) console.warn("ELEVENLABS_VOICE_ID is not set");
 if (!OPENAI_API_KEY) console.warn("OPENAI_API_KEY is not set");
 
 // ==== клиенты ====
-const eleven = new ElevenLabsClient({ apiKey: ELEVENLABS_API_KEY });
+const elevenClient = new ElevenLabsClient({
+  apiKey: process.env.ELEVENLABS_API_KEY,
+});
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
 // ==== Express + HTTP + WS ====
@@ -439,7 +441,7 @@ async function streamTtsToTwilio(streamSid, text) {
   const modelId = process.env.ELEVENLABS_TTS_MODEL_ID || "eleven_flash_v2_5";
 
   // 1) Получаем весь аудио-стрим целиком (ulaw_8000)
-  const response = await eleven.textToSpeech.convert(voiceId, {
+  const response = await elevenClient.textToSpeech.convert(voiceId, {
     modelId,
     outputFormat: "ulaw_8000",
     text,
