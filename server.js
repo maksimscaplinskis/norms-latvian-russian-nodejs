@@ -254,7 +254,7 @@ wss.on('connection', async (twilioWs, req) => {
           scribeConn = null;
         }
         if (rawUlawChunks.length) {
-          const rawPath = `/tmp/${streamSid || 'unknown'}-twilio-ulaw8k.raw`;
+          const rawPath = `/home/site/${streamSid || 'unknown'}-twilio-ulaw8k.raw`;
           fs.writeFile(rawPath, Buffer.concat(rawUlawChunks), (err) => {
             if (err) {
               console.error(`[${streamSid}] ❌ Failed to write raw audio:`, err);
