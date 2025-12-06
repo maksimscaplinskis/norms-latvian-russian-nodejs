@@ -116,15 +116,15 @@ wss.on('connection', async (twilioWs, req) => {
         `[${streamSid}] Connecting to ElevenLabs Scribe v2 Realtime (ulaw_8000, VAD)...`
       );
 
-      scribeConn = await elevenClient.speechToText.realtime.stream({
+      scribeConn = await elevenClient.speechToText.realtime.connect({
         modelId: SCRIBE_MODEL_ID,
         audioFormat: AudioFormat.ULAW_8000,
         sampleRate: 8000,
         commitStrategy: CommitStrategy.VAD,
-        vadSilenceThresholdSecs: 1.0,
-        vadThreshold: 0.7,          // чуть более чувствительный VAD
-        minSpeechDurationMs: 400,
-        minSilenceDurationMs: 250,
+        vadSilenceThresholdSecs: 0.5,
+        vadThreshold: 0.4,          // чуть более чувствительный VAD
+        minSpeechDurationMs: 200,
+        minSilenceDurationMs: 200,
         languageCode: 'ru',         // ВАЖНО: говори по-русски в тесте
         includeTimestamps: true,
       });
