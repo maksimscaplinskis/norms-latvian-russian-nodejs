@@ -116,7 +116,7 @@ wss.on('connection', async (twilioWs, req) => {
         `[${streamSid}] Connecting to ElevenLabs Scribe v2 Realtime (ulaw_8000, VAD)...`
       );
 
-      scribeConn = await elevenClient.speechToText.realtime.connect({
+      scribeConn = await elevenClient.speechToText.realtime.stream({
         modelId: SCRIBE_MODEL_ID,
         audioFormat: AudioFormat.ULAW_8000,
         sampleRate: 8000,
