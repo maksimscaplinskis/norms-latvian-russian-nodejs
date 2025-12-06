@@ -278,12 +278,8 @@ wss.on('connection', async (twilioWs, req) => {
         // safeSendToScribe(payload);
 
         // 🟢 Теперь: декодируем μ-law → PCM16 и только потом отправляем
-        const pcmB64 = twilioMulawBase64ToPcm16Base64(payload);
-        if (!pcmB64) {
-          // тихий чанк — пропускаем
-          return;
-        }
-        safeSendToScribe(pcmB64);
+        const pcmBase64 = twilioMulawBase64ToPcm16Base64(payload);
+        safeSendToScribe(pcmBase64);
 
         break;
       }
@@ -341,30 +337,20 @@ server.listen(PORT, () => {
 });
 
 function twilioMulawBase64ToPcm16Base64(mulawB64) {
+  // Twilio payload (base64) -> raw bytes
   const muLawBuffer = Buffer.from(mulawB64, 'base64');
 
+  // Uint8Array для alawmulaw
   const muLawArray = new Uint8Array(
     muLawBuffer.buffer,
     muLawBuffer.byteOffset,
     muLawBuffer.byteLength
   );
 
+  // 🟢 mu-law 8-bit -> PCM Int16
   const pcmInt16 = alawmulaw.mulaw.decode(muLawArray);
 
-  // --- простейший RMS ---
-  let sumSq = 0;
-  for (let i = 0; i < pcmInt16.length; i++) {
-    const v = pcmInt16[i];
-    sumSq += v * v;
-  }
-  const rms = Math.sqrt(sumSq / pcmInt16.length);
-
-  // Порог подбирается опытно, например 500–1500
-  if (rms < 800) {
-    // считаем чистым фоном → не шлём в Scribe
-    return null;
-  }
-
+  // Int16Array -> Buffer -> base64
   const pcmBuffer = Buffer.from(pcmInt16.buffer);
   return pcmBuffer.toString('base64');
 }
