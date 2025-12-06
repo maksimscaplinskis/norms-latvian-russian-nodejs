@@ -125,17 +125,16 @@ wss.on('connection', async (twilioWs, req) => {
         commitStrategy: CommitStrategy.VAD,
         // 1) Сколько тишины после речи, прежде чем зафиксировать сегмент
         // 0.35–0.4сек — компромисс между скоростью и "не рубить слова"
-        vadSilenceThresholdSecs: 0.35,
+        vadSilenceThresholdSecs: 0.25,
         // 2) Чувствительность к речи vs шуму
         // 0.5 – строже, чем 0.4, но не конский 0.7
-        vadThreshold: 0.5,
+        vadThreshold: 0.45,
         // 3) Минимальная длина речи для сегмента
         // 250ms — хватает для "да"/"нет", но резкий шум + щелчок уже сложнее пролезть
-        minSpeechDurationMs: 250,
+        minSpeechDurationMs: 220,
         // 4) Минимальная длина тишины между сегментами
         // Меньше — быстрее коммит, но больше риск нарубить длинную фразу на куски
-        minSilenceDurationMs: 180,
-        languageCode: 'ru',        // 'lv' для латышского; позже можно авто
+        minSilenceDurationMs: 150,      // 'lv' для латышского; позже можно авто
         includeTimestamps: true,
       });
 
@@ -165,9 +164,19 @@ wss.on('connection', async (twilioWs, req) => {
         }
       });
 
+      let lastUserText = '';
+      let lastPartialAt = 0;
+
       scribeConn.on(RealtimeEvents.PARTIAL_TRANSCRIPT, (data) => {
-        if (!data?.text) return;
-        console.log(`[${streamSid}] ✏️ Scribe PARTIAL: "${data.text}"`);
+        const text = (data.text || '').trim();
+        if (!text) return;
+
+        lastUserText = text;
+        lastPartialAt = Date.now();
+        console.log(`[${streamSid}] ✏️ PARTIAL: "${text}"`);
+
+        // Если длина > N символов и последняя тишина > 200–300мс,
+        // можно уже отправлять этот текст в GPT для "подготовки ответа"
       });
 
       scribeConn.on(RealtimeEvents.COMMITTED_TRANSCRIPT, (data) => {
