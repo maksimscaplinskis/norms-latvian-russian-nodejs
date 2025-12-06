@@ -121,12 +121,21 @@ wss.on('connection', async (twilioWs, req) => {
         modelId: SCRIBE_MODEL_ID,
         audioFormat: AudioFormat.PCM_8000,
         sampleRate: 8000,
+        // Сегментация - на основе VAD
         commitStrategy: CommitStrategy.VAD,
-        vadSilenceThresholdSecs: 0.5,
-        vadThreshold: 0.4,          // чуть более чувствительный VAD
-        minSpeechDurationMs: 200,
-        minSilenceDurationMs: 200,
-        languageCode: 'ru',         // ВАЖНО: говори по-русски в тесте
+        // 1) Сколько тишины после речи, прежде чем зафиксировать сегмент
+        // 0.35–0.4сек — компромисс между скоростью и "не рубить слова"
+        vadSilenceThresholdSecs: 0.35,
+        // 2) Чувствительность к речи vs шуму
+        // 0.5 – строже, чем 0.4, но не конский 0.7
+        vadThreshold: 0.5,
+        // 3) Минимальная длина речи для сегмента
+        // 250ms — хватает для "да"/"нет", но резкий шум + щелчок уже сложнее пролезть
+        minSpeechDurationMs: 250,
+        // 4) Минимальная длина тишины между сегментами
+        // Меньше — быстрее коммит, но больше риск нарубить длинную фразу на куски
+        minSilenceDurationMs: 180,
+        languageCode: 'ru',        // 'lv' для латышского; позже можно авто
         includeTimestamps: true,
       });
 
@@ -164,30 +173,32 @@ wss.on('connection', async (twilioWs, req) => {
       scribeConn.on(RealtimeEvents.COMMITTED_TRANSCRIPT, (data) => {
         let text = (data.text || '').trim();
 
+        // 1) Пусто — считаем шумом/тишиной
         if (!text) {
-          console.log(`[${streamSid}] FINAL empty → считаем шумом, игнорируем`);
+          console.log(`[${streamSid}] FINAL empty → шум, игнорируем`);
           return;
         }
 
-        // Явные "шумовые" лейблы — *static*, *background noise*, и т.п.
+        // 2) Явные шумовые теги от модели
         if (/^\*static\*$/i.test(text) || /^\*noise\*$/i.test(text)) {
           console.log(`[${streamSid}] FINAL noise tag (${text}) → игнорируем`);
           return;
         }
 
-        // Можно дополнительно отсеивать очень короткие/подозрительные куски,
-        // например меньше 3 символов и без букв
+        // 3) Защита от "мусора": слишком коротко и без букв
         if (text.length < 3 || !/[a-zA-Zа-яА-Яāēīūščņļģķž]/.test(text)) {
-          console.log(`[${streamSid}] FINAL too short / no letters (${text}) → игнорируем`);
+          console.log(
+            `[${streamSid}] FINAL too short or no letters (${text}) → игнорируем`
+          );
           return;
         }
 
         console.log(`[${streamSid}] ✅ REAL FINAL: "${text}"`);
 
-        // И вот тут уже дальше:
-        //  - отправлять в GPT
-        //  - логировать как "реплику пользователя"
-        //  - и т.д.
+        // Здесь уже:
+        // - пушим текст в GPT
+        // - логируем диалог
+        // - триггерим ответ бота и т.п.
       });
 
       scribeConn.on(
@@ -267,8 +278,12 @@ wss.on('connection', async (twilioWs, req) => {
         // safeSendToScribe(payload);
 
         // 🟢 Теперь: декодируем μ-law → PCM16 и только потом отправляем
-        const pcmBase64 = twilioMulawBase64ToPcm16Base64(payload);
-        safeSendToScribe(pcmBase64);
+        const pcmB64 = twilioMulawBase64ToPcm16Base64(payload);
+        if (!pcmB64) {
+          // тихий чанк — пропускаем
+          return;
+        }
+        safeSendToScribe(pcmB64);
 
         break;
       }
@@ -326,20 +341,30 @@ server.listen(PORT, () => {
 });
 
 function twilioMulawBase64ToPcm16Base64(mulawB64) {
-  // Twilio payload (base64) -> raw bytes
   const muLawBuffer = Buffer.from(mulawB64, 'base64');
 
-  // Uint8Array для alawmulaw
   const muLawArray = new Uint8Array(
     muLawBuffer.buffer,
     muLawBuffer.byteOffset,
     muLawBuffer.byteLength
   );
 
-  // 🟢 mu-law 8-bit -> PCM Int16
   const pcmInt16 = alawmulaw.mulaw.decode(muLawArray);
 
-  // Int16Array -> Buffer -> base64
+  // --- простейший RMS ---
+  let sumSq = 0;
+  for (let i = 0; i < pcmInt16.length; i++) {
+    const v = pcmInt16[i];
+    sumSq += v * v;
+  }
+  const rms = Math.sqrt(sumSq / pcmInt16.length);
+
+  // Порог подбирается опытно, например 500–1500
+  if (rms < 800) {
+    // считаем чистым фоном → не шлём в Scribe
+    return null;
+  }
+
   const pcmBuffer = Buffer.from(pcmInt16.buffer);
   return pcmBuffer.toString('base64');
 }
