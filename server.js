@@ -121,10 +121,10 @@ wss.on('connection', async (twilioWs, req) => {
         audioFormat: AudioFormat.ULAW_8000,
         sampleRate: 8000,
         commitStrategy: CommitStrategy.VAD,
-        vadSilenceThresholdSecs: 0.5,
-        vadThreshold: 0.3,          // чуть более чувствительный VAD
-        minSpeechDurationMs: 150,
-        minSilenceDurationMs: 150,
+        vadSilenceThresholdSecs: 1.0,
+        vadThreshold: 0.7,          // чуть более чувствительный VAD
+        minSpeechDurationMs: 400,
+        minSilenceDurationMs: 250,
         languageCode: 'ru',         // ВАЖНО: говори по-русски в тесте
         includeTimestamps: true,
       });
@@ -161,7 +161,32 @@ wss.on('connection', async (twilioWs, req) => {
       });
 
       scribeConn.on(RealtimeEvents.COMMITTED_TRANSCRIPT, (data) => {
-        console.log(`[${streamSid}] ✅ Scribe FINAL: "${data.text}"`);
+        let text = (data.text || '').trim();
+
+        if (!text) {
+          console.log(`[${streamSid}] FINAL empty → считаем шумом, игнорируем`);
+          return;
+        }
+
+        // Явные "шумовые" лейблы — *static*, *background noise*, и т.п.
+        if (/^\*static\*$/i.test(text) || /^\*noise\*$/i.test(text)) {
+          console.log(`[${streamSid}] FINAL noise tag (${text}) → игнорируем`);
+          return;
+        }
+
+        // Можно дополнительно отсеивать очень короткие/подозрительные куски,
+        // например меньше 3 символов и без букв
+        if (text.length < 3 || !/[a-zA-Zа-яА-Яāēīūščņļģķž]/.test(text)) {
+          console.log(`[${streamSid}] FINAL too short / no letters (${text}) → игнорируем`);
+          return;
+        }
+
+        console.log(`[${streamSid}] ✅ REAL FINAL: "${text}"`);
+
+        // И вот тут уже дальше:
+        //  - отправлять в GPT
+        //  - логировать как "реплику пользователя"
+        //  - и т.д.
       });
 
       scribeConn.on(
