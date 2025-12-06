@@ -262,9 +262,9 @@ wss.on('connection', async (twilioWs, req) => {
         if (!payload) break;
 
         const buf = Buffer.from(payload, 'base64');
-        console.log(
-          `[${streamSid}] Twilio MEDIA seq=${sequenceNumber}, ts=${timestamp}, bytes=${buf.length}`
-        );
+        // console.log(
+        //   `[${streamSid}] Twilio MEDIA seq=${sequenceNumber}, ts=${timestamp}, bytes=${buf.length}`
+        // );
         rawUlawChunks.push(buf);
 
         // payload — уже base64 ulaw 8000 от Twilio → отправляем как есть
