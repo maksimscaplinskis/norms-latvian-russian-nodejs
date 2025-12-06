@@ -15,6 +15,7 @@
     "openai": "^4.70.0",
     "@elevenlabs/elevenlabs-js": "^2.25.1",
     "dotenv": "^16.0.0",
-    "twilio":"^5.10.7"
+    "twilio":"^5.10.7",
+    "alawmulaw":"^6.0.0"
   }
 }

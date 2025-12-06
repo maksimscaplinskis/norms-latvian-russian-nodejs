@@ -10,6 +10,7 @@ import {
   RealtimeEvents,
 } from '@elevenlabs/elevenlabs-js';
 import fs from 'fs';
+import * as alawmulaw from 'alawmulaw';
 
 // ==== Конфиг ====
 
@@ -118,7 +119,7 @@ wss.on('connection', async (twilioWs, req) => {
 
       scribeConn = await elevenClient.speechToText.realtime.connect({
         modelId: SCRIBE_MODEL_ID,
-        audioFormat: AudioFormat.ULAW_8000,
+        audioFormat: AudioFormat.PCM_8000,
         sampleRate: 8000,
         commitStrategy: CommitStrategy.VAD,
         vadSilenceThresholdSecs: 0.5,
@@ -259,16 +260,16 @@ wss.on('connection', async (twilioWs, req) => {
 
         const { sequenceNumber, media } = msg;
         const { timestamp, chunk, payload } = media || {};
+
         if (!payload) break;
 
-        const buf = Buffer.from(payload, 'base64');
-        // console.log(
-        //   `[${streamSid}] Twilio MEDIA seq=${sequenceNumber}, ts=${timestamp}, bytes=${buf.length}`
-        // );
-        rawUlawChunks.push(buf);
+        // 🔴 Раньше: отправляли μ-law как есть
+        // safeSendToScribe(payload);
 
-        // payload — уже base64 ulaw 8000 от Twilio → отправляем как есть
-        safeSendToScribe(payload);
+        // 🟢 Теперь: декодируем μ-law → PCM16 и только потом отправляем
+        const pcmBase64 = twilioMulawBase64ToPcm16Base64(payload);
+        safeSendToScribe(pcmBase64);
+
         break;
       }
 
@@ -323,3 +324,23 @@ server.listen(PORT, () => {
   console.log(`   Voice webhook URL: POST https://<your-host>/voice`);
   console.log(`   Media WebSocket URL: wss://<your-host>/twilio-stream`);
 });
+
+function twilioMulawBase64ToPcm16Base64(payloadBase64) {
+  // Twilio даёт base64 от байтов μ-law
+  const muLawBuf = Buffer.from(payloadBase64, 'base64');
+
+  // alawmulaw ожидает Uint8Array
+  const muLawArray = new Uint8Array(
+    muLawBuf.buffer,
+    muLawBuf.byteOffset,
+    muLawBuf.byteLength
+  );
+
+  // Получаем Int16Array PCM 8kHz
+  const pcmInt16 = alawmulaw.mulaw.decode(muLawArray);
+
+  // Оборачиваем в Buffer и кодируем обратно в base64 для Scribe
+  const pcmBuf = Buffer.from(pcmInt16.buffer);
+
+  return pcmBuf.toString('base64');
+}
