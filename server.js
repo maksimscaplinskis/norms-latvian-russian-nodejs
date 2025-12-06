@@ -10,7 +10,7 @@ import {
   RealtimeEvents,
 } from '@elevenlabs/elevenlabs-js';
 import fs from 'fs';
-import * as alawmulaw from 'alawmulaw';
+import alawmulaw from 'alawmulaw';
 
 // ==== Конфиг ====
 
@@ -325,22 +325,21 @@ server.listen(PORT, () => {
   console.log(`   Media WebSocket URL: wss://<your-host>/twilio-stream`);
 });
 
-function twilioMulawBase64ToPcm16Base64(payloadBase64) {
-  // Twilio даёт base64 от байтов μ-law
-  const muLawBuf = Buffer.from(payloadBase64, 'base64');
+function twilioMulawBase64ToPcm16Base64(mulawB64) {
+  // Twilio payload (base64) -> raw bytes
+  const muLawBuffer = Buffer.from(mulawB64, 'base64');
 
-  // alawmulaw ожидает Uint8Array
+  // Uint8Array для alawmulaw
   const muLawArray = new Uint8Array(
-    muLawBuf.buffer,
-    muLawBuf.byteOffset,
-    muLawBuf.byteLength
+    muLawBuffer.buffer,
+    muLawBuffer.byteOffset,
+    muLawBuffer.byteLength
   );
 
-  // Получаем Int16Array PCM 8kHz
+  // 🟢 mu-law 8-bit -> PCM Int16
   const pcmInt16 = alawmulaw.mulaw.decode(muLawArray);
 
-  // Оборачиваем в Buffer и кодируем обратно в base64 для Scribe
-  const pcmBuf = Buffer.from(pcmInt16.buffer);
-
-  return pcmBuf.toString('base64');
+  // Int16Array -> Buffer -> base64
+  const pcmBuffer = Buffer.from(pcmInt16.buffer);
+  return pcmBuffer.toString('base64');
 }
