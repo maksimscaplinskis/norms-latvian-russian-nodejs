@@ -125,10 +125,10 @@ wss.on('connection', async (twilioWs, req) => {
         commitStrategy: CommitStrategy.VAD,
         // 1) Сколько тишины после речи, прежде чем зафиксировать сегмент
         // 0.35–0.4сек — компромисс между скоростью и "не рубить слова"
-        vadSilenceThresholdSecs: 0.25,
+        vadSilenceThresholdSecs: 0.3,
         // 2) Чувствительность к речи vs шуму
         // 0.5 – строже, чем 0.4, но не конский 0.7
-        vadThreshold: 0.45,
+        vadThreshold: 0.5,
         // 3) Минимальная длина речи для сегмента
         // 250ms — хватает для "да"/"нет", но резкий шум + щелчок уже сложнее пролезть
         minSpeechDurationMs: 220,
